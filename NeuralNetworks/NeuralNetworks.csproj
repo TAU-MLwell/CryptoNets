@@ -83,6 +83,7 @@
     <Compile Include="LLPackedDenseLayer.cs" />
     <Compile Include="LLDenseLayer.cs" />
     <Compile Include="LLDuplicateLayer.cs" />
+    <Compile Include="LLRollLayer.cs" />
     <Compile Include="LLSingleLineReader.cs" />
     <Compile Include="LLPoolLayer.cs" />
     <Compile Include="LLPreConvLayer.cs" />

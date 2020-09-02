@@ -5,7 +5,8 @@
 using NeuralNetworks;
 using HEWrapper;
 using CommandLine;
-
+using System.Collections;
+using System.Linq;
 
 namespace CifarCryptoNet
 {
@@ -24,7 +25,6 @@ namespace CifarCryptoNet
             var parsed = Parser.Default.ParseArguments<Options>(args).WithParsed(x => options = x);
             if (parsed.Tag == ParserResultType.NotParsed) Environment.Exit(-2);
 
-            WeightsReader wr = new WeightsReader("CifarWeight.csv", "CifarBias.csv");
             // Model has accuracy of 76.5
             // Current parameters (scale) provide accuracy of 76.31% and uses 78.55 + 1 bits in message length
             // It has a latency of 740 seconds on the reference machine (Azure B8ms server at rest)
@@ -40,6 +40,52 @@ namespace CifarCryptoNet
             bool verbose = options.Verbose;
 
             string fileName = "cifar-test.tsv";
+            var tup = GetPotentialyFastNetwork(factory, verbose, fileName);
+            //var tup = GetNetwork(factory, verbose, fileName);
+            var network = tup.Item1;
+            var readerLayer = tup.Item2;
+            Console.WriteLine("Preparing");
+            network.PrepareNetwork();
+            int count = 0;
+            int errs = 0;
+            int batchSize = 1;
+            while (count < numberOfRecords)
+            {
+                using (var m = network.GetNext())
+                {
+                    Utils.ProcessInEnv(env =>
+                    {
+                        var decrypted = m.Decrypt(env);
+                        int pred = 0;
+                        for (int j = 1; j < decrypted.RowCount; j++)
+                        {
+                            if (decrypted[j, 0] > decrypted[pred, 0]) pred = j;
+                        }
+                        if (pred != readerLayer.Labels[0]) errs++;
+                        count++;
+                        if (count % batchSize == 0)
+                        {
+                            Console.Write("errs {0}/{1} accuracy {2:0.000}% prediction {3} label {4} {5}ms", errs, count, 100 - (100.0 * errs / (count)), pred, readerLayer.Labels[0], TimingLayer.GetStats());
+                            if (options.Encrypt)
+                                Console.WriteLine();
+                            else
+                                Console.WriteLine(" 2^{0} largest-value", Math.Log(RawMatrix.Max) / Math.Log(2));
+
+                        }
+
+                    }, factory);
+                }
+            }
+            Console.WriteLine("errs {0}/{1} accuracy {2:0.000}%", errs, count, 100 - (100.0 * errs / (count)));
+            network.DisposeNetwork();
+            if (!options.Encrypt)
+                Console.WriteLine("Max computed value 2^{1}", Math.Log(RawMatrix.Max) / Math.Log(2));
+        }
+
+        public static Tuple<INetwork, IInputLayer> GetNetwork(IFactory factory, bool verbose, string fileName)
+        {
+            WeightsReader wr = new WeightsReader("CifarWeight.csv", "CifarBias.csv");
+
             var readerLayer = new LLConvReader
             {
                 FileName = fileName,
@@ -127,44 +173,93 @@ namespace CifarCryptoNet
             };
 
             var StopTimingLayer = new TimingLayer() { Source = DenseLayer6, StopCounters = new string[] { "Inference-Time" } };
+            return new Tuple<INetwork,IInputLayer> (StopTimingLayer, readerLayer);
 
-            var network = StopTimingLayer;
-            Console.WriteLine("Preparing");
-            network.PrepareNetwork();
-            int count = 0;
-            int errs = 0;
-            int batchSize = 1;
-            while (count < numberOfRecords)
-            {
-                using (var m = network.GetNext())
-                {
-                    Utils.ProcessInEnv(env =>
-                    {
-                        var decrypted = m.Decrypt(env);
-                        int pred = 0;
-                        for (int j = 1; j < decrypted.RowCount; j++)
-                        {
-                            if (decrypted[j, 0] > decrypted[pred, 0]) pred = j;
-                        }
-                        if (pred != readerLayer.Labels[0]) errs++;
-                        count++;
-                        if (count % batchSize == 0)
-                        {
-                            Console.Write("errs {0}/{1} accuracy {2:0.000}% prediction {3} label {4} {5}ms", errs, count, 100 - (100.0 * errs / (count)), pred, readerLayer.Labels[0], TimingLayer.GetStats());
-                            if (options.Encrypt)
-                                Console.WriteLine();
-                            else
-                                Console.WriteLine(" 2^{0} largest-value", Math.Log(RawMatrix.Max) / Math.Log(2));
 
-                        }
-
-                    }, factory);
-                }
-            }
-            Console.WriteLine("errs {0}/{1} accuracy {2:0.000}%", errs, count, 100 - (100.0 * errs / (count)));
-            network.DisposeNetwork();
-            if (!options.Encrypt)
-                Console.WriteLine("Max computed value 2^{1}", Math.Log(RawMatrix.Max) / Math.Log(2));
         }
+
+        public static Tuple<INetwork, IInputLayer> GetPotentialyFastNetwork(IFactory factory, bool verbose, string fileName)
+        {
+            WeightsReader wr = new WeightsReader("CifarWeight.csv", "CifarBias.csv");
+
+            var readerLayer = new LLConvReader
+            {
+                FileName = fileName,
+                SparseFormat = false,
+                InputShape = new int[] { 3, 32, 32 },
+                KernelShape = new int[] { 3, 8, 8 },
+                Upperpadding = new int[] { 0, 1, 1 },
+                Lowerpadding = new int[] { 0, 1, 1 },
+                Stride = new int[] { 1000, 2, 2 },
+                NormalizationFactor = 1.0 / 256.0,
+                Scale = 8,
+                Verbose = verbose
+            };
+
+
+            var EncryptLayer = new EncryptLayer() { Source = readerLayer, Factory = factory };
+            var StartTimingLayer = new TimingLayer() { Source = EncryptLayer, StartCounters = new string[] { "Inference-Time" } };
+
+
+            var ConvLayer1 = new LLPoolLayer()
+            {
+                Source = StartTimingLayer,
+                InputShape = new int[] { 3, 32, 32 },
+                KernelShape = new int[] { 3, 8, 8 },
+                Upperpadding = new int[] { 0, 1, 1 },
+                Lowerpadding = new int[] { 0, 1, 1 },
+                Stride = new int[] { 1000, 2, 2 },
+                MapCount = new int[] { 83, 1, 1 },
+                WeightsScale = 256.0,
+                Weights = (double[])wr.Weights[0],
+                Bias = (double[])wr.Biases[0],
+                Verbose = verbose
+            };
+
+            var VectorizeLayer2 = new LLVectorizeLayer()
+            {
+                Source = ConvLayer1,
+                Verbose = verbose
+            };
+
+            var ActivationLayer3 = new SquareActivation()
+            {
+                Source = VectorizeLayer2,
+                Verbose = verbose
+            };
+
+            var RollLayer4 = new LLRollLayer()
+            {
+                Source = ActivationLayer3,
+                Verbose = verbose,
+                Maps = 1
+            };
+
+
+
+
+            var ActivationLayer5 = new SquareActivation()
+            {
+                Source = RollLayer4,
+                Verbose = verbose
+            };
+
+            var t = Enumerable.Range(0, 162680).Select(x => x * 0.01).ToArray();
+            var DenseLayer6 = new LLDenseLayer()
+            {
+                Source = ActivationLayer5,
+                Weights = t, //(double[])wr.Weights[2],
+                Bias = (double[])wr.Biases[2],
+                WeightsScale = 512.0,
+                InputFormat = EVectorFormat.dense,
+                Verbose = verbose
+            };
+
+            var StopTimingLayer = new TimingLayer() { Source = DenseLayer6, StopCounters = new string[] { "Inference-Time" } };
+            return new Tuple<INetwork, IInputLayer>(StopTimingLayer, readerLayer);
+
+
+        }
+
     }
 }
